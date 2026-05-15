@@ -13,3 +13,5 @@ Embedded_Trial/STM32F103C8TX_FLASH.ld
 
 Schematic_PCB/.history/
 Schematic_PCB/SmartMonitor-backups/
+
+.gitignore
