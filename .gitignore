@@ -1,0 +1,15 @@
+Embedded_Trial/.settings/
+Embedded_Trial/Core/Startup/
+Embedded_Trial/Debug/
+Embedded_Trial/Drivers/
+
+
+
+Embedded_Trial/.cproject
+Embedded_Trial/.mxproject
+Embedded_Trial/.project
+Embedded_Trial/Embedded_Trial.ioc
+Embedded_Trial/STM32F103C8TX_FLASH.ld
+
+Schematic_PCB/.history/
+Schematic_PCB/SmartMonitor-backups/
