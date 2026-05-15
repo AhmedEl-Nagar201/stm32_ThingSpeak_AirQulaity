@@ -1,15 +1,1 @@
-Embedded_Trial/.settings/
-Embedded_Trial/Core/Startup/
-Embedded_Trial/Debug/
-Embedded_Trial/Drivers/
-
-
-
-Embedded_Trial/.cproject
-Embedded_Trial/.mxproject
-Embedded_Trial/.project
-Embedded_Trial/Embedded_Trial.ioc
-Embedded_Trial/STM32F103C8TX_FLASH.ld
-
-Schematic_PCB/.history/
-Schematic_PCB/SmartMonitor-backups/
+Nothing needs to be added to .gitignore since only a README.md file was added, which is a source/config file and not a build artifact, dependency, or temporary file.
