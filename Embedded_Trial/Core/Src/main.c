@@ -71,7 +71,21 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart3;
 
 osThreadId defaultTaskHandle;
+osThreadId mq135TaskHandle;
+osThreadId dht22TaskHandle;
+osThreadId displayTaskHandle;
+osThreadId telemetryTaskHandle;
 /* USER CODE BEGIN PV */
+
+/* --- RTOS Sync Objects --- */
+osSemaphoreId sem_mq135_start;
+osSemaphoreId sem_3v3_start;
+osSemaphoreId sem_mq135_done;
+osSemaphoreId sem_dht_done;
+osSemaphoreId sem_display_start;
+osSemaphoreId sem_tx_start;
+osSemaphoreId sem_display_done;
+osSemaphoreId sem_tx_done;
 static DHT22_Data_t        dht_data;
 static MQ135_GasReadings_t gas_data;
 static char                msg[40];     /* Scratch buffer for display strings */
@@ -130,7 +144,10 @@ static void MX_RTC_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-
+void MQ135Task(void const * argument);
+void DHT22Task(void const * argument);
+void DisplayTask(void const * argument);
+void TelemetryTask(void const * argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -286,52 +303,12 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start(&htim1);
 
-  /* ---- Initialise sensor drivers ---- */
+  /* ---- Initialise sensor drivers (Handles only) ---- */
   DHT22_Init(DHT22_PORT, DHT22_PIN, &htim1);
   MQ135_Init(&hadc2, MQ135_RL_KOHM);
 
-  /* Small power-on delay for OLED capacitor charge */
-  HAL_Delay(100);
-
-  oled_ok = SSD1306_Init();
-  if (!oled_ok) {
-    printf("\r\n[WARN] SSD1306 not found on I2C (addr=0x78). Check wiring!\r\n");
-  } else {
-    SSD1306_Fill(SSD1306_COLOR_BLACK);
-    SSD1306_GotoXY(10, 10);
-    SSD1306_Puts("Air Quality", &Font_7x10, SSD1306_COLOR_WHITE);
-    SSD1306_GotoXY(10, 26);
-    SSD1306_Puts("Monitor v2.0", &Font_7x10, SSD1306_COLOR_WHITE);
-    SSD1306_GotoXY(10, 42);
-    SSD1306_Puts("Calibrating...", &Font_7x10, SSD1306_COLOR_WHITE);
-    SSD1306_UpdateScreen();
-  }
-
-  printf("\r\n=== DHT22 + MQ135 + OLED + ESP01 ===\r\n");
-  printf("USART1 @115200 -> HW-417C (PA9 TX / PA10 RX)\r\n");
-  printf("USART3 @115200 -> ESP-01  (PB10 TX / PB11 RX)\r\n");
-  printf("I2C1   @400kHz -> SSD1306 (PB6 SCL / PB7 SDA)\r\n");
-  printf("ADC2 CH5       -> MQ135   (PA5)\r\n");
-  printf("DHT22          -> PA1\r\n");
-  printf("====================================\r\n");
-
-  /* ---- Calibrate MQ135 R0 in clean air ----
-   * NOTE: For accurate results, run this in clean outdoor air after
-   * the sensor has preheated for 24+ hours on first use.
-   * Once you know your R0, you can hardcode it with MQ135_SetR0()
-   * instead of calibrating every boot.
-   */
-  printf("[MQ135] Calibrating R0 (%d samples)...\r\n", MQ135_CAL_SAMPLES);
-  float r0 = MQ135_CalibrateR0(MQ135_CAL_SAMPLES);
-  if (r0 > 0.0f) {
-    printf("[MQ135] R0 = %.2f kOhm (calibrated)\r\n", r0);
-  } else {
-    printf("[MQ135] Calibration FAILED. Using default R0.\r\n");
-    MQ135_SetR0(10.0f);  /* Fallback default */
-  }
-
-  /* Wait for DHT22 to stabilise after power-on */
-  HAL_Delay(2000);
+  printf("\r\n=== DHT22 + MQ135 + OLED + ESP01 (RTOS + Deep Sleep) ===\r\n");
+  printf("System Initialized. Entering RTOS Scheduler...\r\n");
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -339,7 +316,15 @@ int main(void)
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
+  /* Binary semaphores: created with count=1, then immediately taken to start at 0 */
+  osSemaphoreDef(sem_mq135_start);  sem_mq135_start  = osSemaphoreCreate(osSemaphore(sem_mq135_start),  1); osSemaphoreWait(sem_mq135_start,  0);
+  osSemaphoreDef(sem_3v3_start);    sem_3v3_start    = osSemaphoreCreate(osSemaphore(sem_3v3_start),    1); osSemaphoreWait(sem_3v3_start,    0);
+  osSemaphoreDef(sem_mq135_done);   sem_mq135_done   = osSemaphoreCreate(osSemaphore(sem_mq135_done),   1); osSemaphoreWait(sem_mq135_done,   0);
+  osSemaphoreDef(sem_dht_done);     sem_dht_done     = osSemaphoreCreate(osSemaphore(sem_dht_done),     1); osSemaphoreWait(sem_dht_done,     0);
+  osSemaphoreDef(sem_display_start);sem_display_start= osSemaphoreCreate(osSemaphore(sem_display_start),1); osSemaphoreWait(sem_display_start,0);
+  osSemaphoreDef(sem_tx_start);     sem_tx_start     = osSemaphoreCreate(osSemaphore(sem_tx_start),     1); osSemaphoreWait(sem_tx_start,     0);
+  osSemaphoreDef(sem_display_done); sem_display_done = osSemaphoreCreate(osSemaphore(sem_display_done), 1); osSemaphoreWait(sem_display_done, 0);
+  osSemaphoreDef(sem_tx_done);      sem_tx_done      = osSemaphoreCreate(osSemaphore(sem_tx_done),      1); osSemaphoreWait(sem_tx_done,      0);
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -351,12 +336,22 @@ int main(void)
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
+  /* definition and creation of defaultTask (PowerManagerTask) */
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityHigh, 0, 256);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  osThreadDef(mq135Task,    MQ135Task,    osPriorityNormal,      0, 256);
+  mq135TaskHandle    = osThreadCreate(osThread(mq135Task),    NULL);
+
+  osThreadDef(dht22Task,    DHT22Task,    osPriorityNormal,      0, 256);
+  dht22TaskHandle    = osThreadCreate(osThread(dht22Task),    NULL);
+
+  osThreadDef(displayTask,  DisplayTask,  osPriorityBelowNormal, 0, 256);
+  displayTaskHandle  = osThreadCreate(osThread(displayTask),  NULL);
+
+  osThreadDef(telemetryTask,TelemetryTask,osPriorityNormal,      0, 256);
+  telemetryTaskHandle= osThreadCreate(osThread(telemetryTask),NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -372,23 +367,6 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    /* ---- 1. Read DHT22 ---- */
-    if (!DHT22_ReadData(&dht_data)) {
-      printf("DHT22: Read failed\r\n");
-    }
-
-    /* ---- 2. Read MQ135 (all gases, with temp/humidity compensation) ---- */
-    if (!MQ135_ReadAllGases(&gas_data, dht_data.temperature, dht_data.humidity)) {
-      printf("MQ135: Read failed\r\n");
-    }
-
-    /* ---- 3. Output results ---- */
-    PrintReadings();
-    UpdateOLED();
-    SendTelemetry();
-
-    /* DHT22 requires minimum 2 s between readings */
-    HAL_Delay(2000);
   }
   /* USER CODE END 3 */
 }
@@ -742,6 +720,172 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+/**
+ * @brief  MQ135Task – waits for PA2 (5V) to be ON, then reads all gas values.
+ *         Signals PowerManagerTask when complete via sem_mq135_done.
+ */
+void MQ135Task(void const * argument)
+{
+  for (;;)
+  {
+    /* Block until PowerManagerTask enables 5V rail and signals us */
+    osSemaphoreWait(sem_mq135_start, osWaitForever);
+
+    printf("[MQ135] Reading gas sensors...\r\n");
+    MQ135_SetR0(10.0f); /* Fixed R0 — no cold calibration on every wake */
+
+    if (!MQ135_ReadAllGases(&gas_data, dht_data.temperature, dht_data.humidity))
+    {
+      printf("[WARN][MQ135] Read failed\r\n");
+    }
+    else
+    {
+      printf("[MQ135] CO2: %.1f ppm  NH3: %.1f ppm  CO: %.1f ppm\r\n",
+             gas_data.co2, gas_data.nh4, gas_data.co);
+    }
+
+    /* Signal PowerManagerTask that MQ135 reading is done */
+    osSemaphoreRelease(sem_mq135_done);
+  }
+}
+
+/**
+ * @brief  DHT22Task – waits for 3.3V rail to be ON, then reads temperature/humidity.
+ *         Signals PowerManagerTask when complete via sem_dht_done.
+ */
+void DHT22Task(void const * argument)
+{
+  for (;;)
+  {
+    /* Block until PowerManagerTask enables 3.3V rail */
+    osSemaphoreWait(sem_3v3_start, osWaitForever);
+
+    /* DHT22 needs at least 2s after power-on to stabilise */
+    osDelay(2000);
+
+    printf("[DHT22] Reading temperature & humidity...\r\n");
+    if (!DHT22_ReadData(&dht_data))
+    {
+      printf("[WARN][DHT22] Read failed\r\n");
+    }
+    else
+    {
+      printf("[DHT22] T: %.1f C  H: %.1f %%RH\r\n",
+             dht_data.temperature, dht_data.humidity);
+    }
+
+    /* Signal PowerManagerTask that DHT22 reading is done */
+    osSemaphoreRelease(sem_dht_done);
+  }
+}
+
+/**
+ * @brief  DisplayTask – waits for both sensors to finish, re-inits OLED,
+ *         then renders all readings. Signals completion via sem_display_done.
+ */
+void DisplayTask(void const * argument)
+{
+  for (;;)
+  {
+    /* Block until PowerManagerTask has collected all sensor data */
+    osSemaphoreWait(sem_display_start, osWaitForever);
+
+    printf("[DISPLAY] Updating OLED...\r\n");
+
+    /* Re-init OLED — it just received power */
+    oled_ok = SSD1306_Init();
+    if (oled_ok)
+    {
+      SSD1306_Fill(SSD1306_COLOR_BLACK);
+
+      /* Row 0 – Temperature & Humidity */
+      SSD1306_GotoXY(0, 0);
+      sprintf(msg, "T:%.1fC H:%.1f%%", dht_data.temperature, dht_data.humidity);
+      SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
+
+      /* Row 1 – CO2 */
+      SSD1306_GotoXY(0, 12);
+      sprintf(msg, "CO2: %.0f ppm", gas_data.co2);
+      SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
+
+      /* Row 2 – NH3 */
+      SSD1306_GotoXY(0, 24);
+      sprintf(msg, "NH3: %.0f ppm", gas_data.nh4);
+      SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
+
+      /* Row 3 – CO */
+      SSD1306_GotoXY(0, 36);
+      sprintf(msg, "CO:  %.1f ppm", gas_data.co);
+      SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
+
+      /* Row 4 – Toluene & Acetone */
+      SSD1306_GotoXY(0, 48);
+      sprintf(msg, "Tol:%.0f Ace:%.0f", gas_data.toluene, gas_data.acetone);
+      SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
+
+      SSD1306_UpdateScreen();
+    }
+    else
+    {
+      printf("[WARN][DISPLAY] SSD1306 init failed\r\n");
+    }
+
+    osSemaphoreRelease(sem_display_done);
+  }
+}
+
+/**
+ * @brief  TelemetryTask – waits for all sensor data to be ready, then prints
+ *         readings to debug UART and sends the binary frame to ESP-01.
+ *         Signals completion via sem_tx_done.
+ */
+void TelemetryTask(void const * argument)
+{
+  for (;;)
+  {
+    /* Block until PowerManagerTask gives the green light */
+    osSemaphoreWait(sem_tx_start, osWaitForever);
+
+    /* ---- Debug print to USART1 ---- */
+    printf("--- Sensor Readings ---\r\n");
+    printf("DHT22  T: %.1f C   H: %.1f %%RH\r\n",
+           dht_data.temperature, dht_data.humidity);
+    printf("MQ135  ADC: %u   Rs: %.2f kOhm   R0: %.2f kOhm\r\n",
+           gas_data.adc_raw, gas_data.rs, MQ135_GetR0());
+    printf("  CO2:     %.1f ppm\r\n", gas_data.co2);
+    printf("  NH3:     %.1f ppm\r\n", gas_data.nh4);
+    printf("  CO:      %.1f ppm\r\n", gas_data.co);
+    printf("  Alcohol: %.1f ppm\r\n", gas_data.alcohol);
+    printf("  Toluene: %.1f ppm\r\n", gas_data.toluene);
+    printf("-----------------------\r\n");
+
+    /* ---- Send binary frame to ESP-01 via USART3 ---- */
+    uint8_t frame[FRAME_TOTAL];
+    uint8_t idx = 0;
+    SensorPayload_t p;
+    p.temperature = dht_data.temperature;
+    p.humidity    = dht_data.humidity;
+    p.co2         = gas_data.co2;
+    p.nh3         = gas_data.nh4;
+    p.co          = gas_data.co;
+    p.alcohol     = gas_data.alcohol;
+    p.toluene     = gas_data.toluene;
+    p.adc_raw     = gas_data.adc_raw;
+    frame[idx++] = FRAME_SOF;
+    frame[idx++] = (uint8_t)sizeof(SensorPayload_t);
+    memcpy(&frame[idx], &p, sizeof(SensorPayload_t));
+    idx += sizeof(SensorPayload_t);
+    uint8_t crc = 0;
+    for (uint8_t i = 0; i < idx; i++) crc ^= frame[i];
+    frame[idx++] = crc;
+    frame[idx++] = FRAME_EOF;
+    HAL_UART_Transmit(&huart3, frame, (uint16_t)idx, 100);
+    printf("[TELEMETRY] Frame sent to ESP-01 (%u bytes)\r\n", (unsigned)idx);
+
+    osSemaphoreRelease(sem_tx_done);
+  }
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -754,10 +898,94 @@ static void MX_GPIO_Init(void)
 void StartDefaultTask(void const * argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
+  /*
+   * PowerManagerTask – the master orchestrator.
+   *
+   * Cycle (every ~5 minutes):
+   *  1. Turn ON 5V  (PA2) → signal MQ135Task to start reading
+   *  2. Wait 20 s for MQ135 to heat up
+   *  3. Turn ON 3.3V (PA3) → signal DHT22Task to start reading
+   *  4. Wait for MQ135Task  done  (sem_mq135_done)
+   *  5. Wait for DHT22Task  done  (sem_dht_done)
+   *  6. Signal DisplayTask  (sem_display_start)
+   *  7. Signal TelemetryTask (sem_tx_start)
+   *  8. Wait for both to finish
+   *  9. Cut power to all modules (PA2 + PA3 LOW)
+   * 10. Arm RTC alarm for T+5 min → enter Stop mode → sleep
+   * 11. RTC fires → wake → restore clocks → repeat
+   */
+  for (;;)
   {
-    osDelay(1);
+    /* ── STEP 1: Enable 5V rail for MQ135 ── */
+    printf("\r\n[PWR] Cycle start — enabling 5V (MQ135)\r\n");
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_SET);
+
+    /* Signal MQ135Task that it can proceed (power is up) */
+    osSemaphoreRelease(sem_mq135_start);
+
+    /* ── STEP 2: Wait 20 s for MQ135 heater ── */
+    osDelay(20000);
+
+    /* ── STEP 3: Enable 3.3V rail (OLED, DHT22, ESP-01) ── */
+    printf("[PWR] Enabling 3.3V (DHT22 / OLED / ESP-01)\r\n");
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
+
+    /* Signal DHT22Task that power is on (it will delay internally) */
+    osSemaphoreRelease(sem_3v3_start);
+
+    /* ── STEP 4 & 5: Wait for both sensor tasks ── */
+    printf("[PWR] Waiting for sensor tasks...\r\n");
+    osSemaphoreWait(sem_mq135_done, osWaitForever);
+    osSemaphoreWait(sem_dht_done,   osWaitForever);
+    printf("[PWR] All sensors ready.\r\n");
+
+    /* ── STEP 6 & 7: Signal output tasks ── */
+    osSemaphoreRelease(sem_display_start);
+    osSemaphoreRelease(sem_tx_start);
+
+    /* ── STEP 8: Wait for output tasks ── */
+    osSemaphoreWait(sem_display_done, osWaitForever);
+    osSemaphoreWait(sem_tx_done,      osWaitForever);
+
+    /* ── STEP 9: Cut power to all modules ── */
+    printf("[PWR] Cutting power to all modules.\r\n");
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2 | GPIO_PIN_3, GPIO_PIN_RESET);
+
+    /* ── STEP 10: Arm RTC alarm for T+5 min ── */
+    RTC_TimeTypeDef sTime = {0};
+    RTC_DateTypeDef sDate = {0};
+    HAL_RTC_GetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN); /* Must read date to unlock shadow regs */
+
+    RTC_AlarmTypeDef sAlarm = {0};
+    sAlarm.AlarmTime.Hours   = sTime.Hours;
+    sAlarm.AlarmTime.Minutes = sTime.Minutes + 5;
+    sAlarm.AlarmTime.Seconds = sTime.Seconds;
+    if (sAlarm.AlarmTime.Minutes >= 60) {
+      sAlarm.AlarmTime.Minutes -= 60;
+      sAlarm.AlarmTime.Hours    = (sAlarm.AlarmTime.Hours + 1) % 24;
+    }
+    sAlarm.Alarm = RTC_ALARM_A;
+    if (HAL_RTC_SetAlarm_IT(&hrtc, &sAlarm, RTC_FORMAT_BIN) != HAL_OK) {
+      printf("[ERR][PWR] RTC Alarm set failed!\r\n");
+    }
+
+    printf("[PWR] Entering Stop Mode (5-min sleep)... ZZZ\r\n");
+
+    /* Suspend FreeRTOS SysTick so it doesn't wake the CPU from Stop mode */
+    HAL_SuspendTick();
+
+    /* ── STEP 10 cont.: Enter Stop mode — CPU halts here ── */
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+    /* ════════════════════════════════════════════════════
+     *  <<< RTC ALARM FIRES — CPU RESUMES HERE >>>  
+     * ════════════════════════════════════════════════════ */
+
+    /* ── STEP 11: Restore PLL clock (Stop mode falls back to HSI) ── */
+    SystemClock_Config();
+    HAL_ResumeTick();
+    printf("[PWR] Woke from Stop mode. Starting new cycle.\r\n");
   }
   /* USER CODE END 5 */
 }
