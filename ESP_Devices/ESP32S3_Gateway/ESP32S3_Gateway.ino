@@ -16,8 +16,8 @@
 #include <HTTPClient.h>
 
 /* ---- Wi-Fi credentials (replace with yours!) ---- */
-const char *WIFI_SSID = "Refa3y";
-const char *WIFI_PASSWORD = "@#Refa3Y#@";
+const char *WIFI_SSID = "ahmed";
+const char *WIFI_PASSWORD = "123456789";
 
 /* ---- ThingSpeak settings ---- */
 const char *THINGSPEAK_API_KEY = "R7CFHMP20DI4PXII"; // Write API Key

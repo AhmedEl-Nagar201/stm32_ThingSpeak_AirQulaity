@@ -86,10 +86,20 @@ osSemaphoreId sem_display_start;
 osSemaphoreId sem_tx_start;
 osSemaphoreId sem_display_done;
 osSemaphoreId sem_tx_done;
+
+/* Bug 2 fix: mutex protecting shared sensor data buffers */
+osMutexId  mtx_sensor_data;
+
 static DHT22_Data_t        dht_data;
 static MQ135_GasReadings_t gas_data;
 static char                msg[40];     /* Scratch buffer for display strings */
 static uint8_t             oled_ok = 0;
+
+/* Bug 5 fix: RTC backup register index used to persist R0 across Stop-mode cycles.
+ * BKP_DR1 holds the integer part (kΩ × 10), BKP_DR2 is a magic-number sentinel. */
+#define R0_BKP_MAGIC  0xA5A5u
+#define R0_BKP_DR_VAL RTC_BKP_DR1   /* stores R0 × 10 as an integer */
+#define R0_BKP_DR_MGC RTC_BKP_DR2   /* magic sentinel */
 
 /*
  * Binary frame sent to ESP-01 via UART3.
@@ -120,7 +130,7 @@ typedef struct {
     float    temperature;
     float    humidity;
     float    co2;
-    float    nh3;
+    float    nh4;   /* Bug 1 fix: renamed nh3→nh4 to match MQ135_GasReadings_t field */
     float    co;
     float    alcohol;
     float    toluene;
@@ -153,6 +163,18 @@ void TelemetryTask(void const * argument);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* Stack overflow hook — required by configCHECK_FOR_STACK_OVERFLOW = 2 */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  (void)xTask;
+  /* Transmit task name directly — printf may not be safe here */
+  HAL_UART_Transmit(&huart1, (uint8_t *)"[FATAL] Stack overflow: ", 24, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)pcTaskName, strlen(pcTaskName), 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"\r\n", 2, 100);
+  __disable_irq();
+  for (;;) { }
+}
+
 /* Retarget printf to USART1 (HW-417C debug) */
 #ifdef __GNUC__
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
@@ -165,103 +187,6 @@ PUTCHAR_PROTOTYPE
   return ch;
 }
 
-/**
- * @brief  Update the OLED with the latest sensor readings.
- */
-static void UpdateOLED(void)
-{
-  if (!oled_ok) return;
-
-  SSD1306_Fill(SSD1306_COLOR_BLACK);
-
-  /* Row 0 – Temperature & Humidity */
-  SSD1306_GotoXY(0, 0);
-  sprintf(msg, "T:%.1fC H:%.1f%%", dht_data.temperature, dht_data.humidity);
-  SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
-
-  /* Row 1 – CO2 */
-  SSD1306_GotoXY(0, 12);
-  sprintf(msg, "CO2: %.0f ppm", gas_data.co2);
-  SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
-
-  /* Row 2 – NH3 (Ammonia) */
-  SSD1306_GotoXY(0, 24);
-  sprintf(msg, "NH3: %.0f ppm", gas_data.nh4);
-  SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
-
-  /* Row 3 – CO */
-  SSD1306_GotoXY(0, 36);
-  sprintf(msg, "CO:  %.1f ppm", gas_data.co);
-  SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
-
-  /* Row 4 – Toluene & Acetone */
-  SSD1306_GotoXY(0, 48);
-  sprintf(msg, "Tol:%.0f Ace:%.0f", gas_data.toluene, gas_data.acetone);
-  SSD1306_Puts(msg, &Font_7x10, SSD1306_COLOR_WHITE);
-
-  SSD1306_UpdateScreen();
-}
-
-/**
- * @brief  Print all sensor readings to the debug UART.
- */
-static void PrintReadings(void)
-{
-  printf("--- Sensor Readings ---\r\n");
-  printf("DHT22  T: %.1f C   H: %.1f %%RH\r\n",
-         dht_data.temperature, dht_data.humidity);
-  printf("MQ135  ADC: %u   Rs: %.2f kOhm   Rs/R0: %.3f   R0: %.2f kOhm\r\n",
-         gas_data.adc_raw, gas_data.rs, gas_data.rs_ro, MQ135_GetR0());
-  printf("  CO2:     %.1f ppm\r\n", gas_data.co2);
-  printf("  NH3:     %.1f ppm\r\n", gas_data.nh4);
-  printf("  CO:      %.1f ppm\r\n", gas_data.co);
-  printf("  Alcohol: %.1f ppm\r\n", gas_data.alcohol);
-  printf("  Toluene: %.1f ppm\r\n", gas_data.toluene);
-  printf("  Acetone: %.1f ppm\r\n", gas_data.acetone);
-  printf("-----------------------\r\n");
-}
-
-/**
- * @brief  Build and transmit a 32-byte binary sensor frame to ESP-01 (UART3).
- *
- * Frame layout:
- *   [0]      0xAA  (SOF)
- *   [1]      payload length
- *   [2..N-2] SensorPayload_t
- *   [N-2]    XOR checksum of all preceding bytes
- *   [N-1]    0x55  (EOF)
- */
-static void SendTelemetry(void)
-{
-  uint8_t frame[FRAME_TOTAL];
-  uint8_t idx = 0;
-
-  /* Fill payload struct */
-  SensorPayload_t p;
-  p.temperature = dht_data.temperature;
-  p.humidity    = dht_data.humidity;
-  p.co2         = gas_data.co2;
-  p.nh3         = gas_data.nh4;
-  p.co          = gas_data.co;
-  p.alcohol     = gas_data.alcohol;
-  p.toluene     = gas_data.toluene;
-  p.adc_raw     = gas_data.adc_raw;
-
-  /* Build frame */
-  frame[idx++] = FRAME_SOF;
-  frame[idx++] = (uint8_t)sizeof(SensorPayload_t);
-  memcpy(&frame[idx], &p, sizeof(SensorPayload_t));
-  idx += sizeof(SensorPayload_t);
-
-  /* XOR checksum over all bytes so far */
-  uint8_t crc = 0;
-  for (uint8_t i = 0; i < idx; i++)
-    crc ^= frame[i];
-  frame[idx++] = crc;
-  frame[idx++] = FRAME_EOF;
-
-  HAL_UART_Transmit(&huart3, frame, (uint16_t)idx, 50);
-}
 
 /* USER CODE END 0 */
 
@@ -312,7 +237,9 @@ int main(void)
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
+  /* Bug 2 fix: create mutex for shared dht_data / gas_data */
+  osMutexDef(mtx_sensor_data);
+  mtx_sensor_data = osMutexCreate(osMutex(mtx_sensor_data));
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -337,20 +264,20 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask (PowerManagerTask) */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityHigh, 0, 256);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityHigh, 0, 384);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  osThreadDef(mq135Task,    MQ135Task,    osPriorityNormal,      0, 256);
+  osThreadDef(mq135Task,    MQ135Task,    osPriorityNormal,      0, 384);
   mq135TaskHandle    = osThreadCreate(osThread(mq135Task),    NULL);
 
-  osThreadDef(dht22Task,    DHT22Task,    osPriorityNormal,      0, 256);
+  osThreadDef(dht22Task,    DHT22Task,    osPriorityNormal,      0, 384);
   dht22TaskHandle    = osThreadCreate(osThread(dht22Task),    NULL);
 
-  osThreadDef(displayTask,  DisplayTask,  osPriorityBelowNormal, 0, 256);
+  osThreadDef(displayTask,  DisplayTask,  osPriorityBelowNormal, 0, 384);
   displayTaskHandle  = osThreadCreate(osThread(displayTask),  NULL);
 
-  osThreadDef(telemetryTask,TelemetryTask,osPriorityNormal,      0, 256);
+  osThreadDef(telemetryTask,TelemetryTask,osPriorityNormal,      0, 384);
   telemetryTaskHandle= osThreadCreate(osThread(telemetryTask),NULL);
   /* USER CODE END RTOS_THREADS */
 
@@ -455,7 +382,8 @@ static void MX_ADC2_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_5;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  /* Bug 6 fix: MQ135 has high source impedance — use max sample time for accuracy */
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -732,16 +660,49 @@ void MQ135Task(void const * argument)
     osSemaphoreWait(sem_mq135_start, osWaitForever);
 
     printf("[MQ135] Reading gas sensors...\r\n");
-    MQ135_SetR0(10.0f); /* Fixed R0 — no cold calibration on every wake */
 
-    if (!MQ135_ReadAllGases(&gas_data, dht_data.temperature, dht_data.humidity))
+    /* Bug 5 fix: restore R0 from RTC backup register, or calibrate once in clean air.
+     * BKP_DR2 acts as a magic-number sentinel to detect first-boot vs. warm wake. */
+    if (HAL_RTCEx_BKUPRead(&hrtc, R0_BKP_DR_MGC) == R0_BKP_MAGIC)
+    {
+      /* Warm wake: restore persisted R0 */
+      uint32_t r0_x10 = HAL_RTCEx_BKUPRead(&hrtc, R0_BKP_DR_VAL);
+      MQ135_SetR0((float)r0_x10 / 10.0f);
+      printf("[MQ135] Restored R0 = %.1f kOhm from backup reg\r\n", (float)r0_x10 / 10.0f);
+    }
+    else
+    {
+      /* First boot: calibrate R0 in (assumed) clean air and persist it */
+      printf("[MQ135] First boot — calibrating R0 in clean air...\r\n");
+      float r0 = MQ135_CalibrateR0(MQ135_CAL_SAMPLES);
+      MQ135_SetR0(r0);
+      HAL_RTCEx_BKUPWrite(&hrtc, R0_BKP_DR_VAL, (uint32_t)(r0 * 10.0f));
+      HAL_RTCEx_BKUPWrite(&hrtc, R0_BKP_DR_MGC, R0_BKP_MAGIC);
+      printf("[MQ135] R0 calibrated = %.2f kOhm, saved to backup reg\r\n", r0);
+    }
+
+    /* Bug 2 fix: take a snapshot of dht_data under mutex for temperature compensation */
+    float t_comp, h_comp;
+    osMutexWait(mtx_sensor_data, osWaitForever);
+    t_comp = dht_data.temperature;
+    h_comp = dht_data.humidity;
+    osMutexRelease(mtx_sensor_data);
+
+    /* Use 25°C / 50%RH as safe defaults on first boot before DHT22 has run */
+    if (t_comp == 0.0f && h_comp == 0.0f) { t_comp = 25.0f; h_comp = 50.0f; }
+
+    MQ135_GasReadings_t local_gas;
+    if (!MQ135_ReadAllGases(&local_gas, t_comp, h_comp))
     {
       printf("[WARN][MQ135] Read failed\r\n");
     }
     else
     {
+      osMutexWait(mtx_sensor_data, osWaitForever);
+      gas_data = local_gas;
+      osMutexRelease(mtx_sensor_data);
       printf("[MQ135] CO2: %.1f ppm  NH3: %.1f ppm  CO: %.1f ppm\r\n",
-             gas_data.co2, gas_data.nh4, gas_data.co);
+             local_gas.co2, local_gas.nh4, local_gas.co);
     }
 
     /* Signal PowerManagerTask that MQ135 reading is done */
@@ -764,14 +725,20 @@ void DHT22Task(void const * argument)
     osDelay(2000);
 
     printf("[DHT22] Reading temperature & humidity...\r\n");
-    if (!DHT22_ReadData(&dht_data))
+
+    /* Bug 2 fix: write into a local buffer, then copy under mutex */
+    DHT22_Data_t local_dht;
+    if (!DHT22_ReadData(&local_dht))
     {
       printf("[WARN][DHT22] Read failed\r\n");
     }
     else
     {
+      osMutexWait(mtx_sensor_data, osWaitForever);
+      dht_data = local_dht;
+      osMutexRelease(mtx_sensor_data);
       printf("[DHT22] T: %.1f C  H: %.1f %%RH\r\n",
-             dht_data.temperature, dht_data.humidity);
+             local_dht.temperature, local_dht.humidity);
     }
 
     /* Signal PowerManagerTask that DHT22 reading is done */
@@ -846,31 +813,39 @@ void TelemetryTask(void const * argument)
     /* Block until PowerManagerTask gives the green light */
     osSemaphoreWait(sem_tx_start, osWaitForever);
 
+    /* Bug 2 fix: take a consistent snapshot of shared data under mutex */
+    DHT22_Data_t        snap_dht;
+    MQ135_GasReadings_t snap_gas;
+    osMutexWait(mtx_sensor_data, osWaitForever);
+    snap_dht = dht_data;
+    snap_gas = gas_data;
+    osMutexRelease(mtx_sensor_data);
+
     /* ---- Debug print to USART1 ---- */
     printf("--- Sensor Readings ---\r\n");
     printf("DHT22  T: %.1f C   H: %.1f %%RH\r\n",
-           dht_data.temperature, dht_data.humidity);
+           snap_dht.temperature, snap_dht.humidity);
     printf("MQ135  ADC: %u   Rs: %.2f kOhm   R0: %.2f kOhm\r\n",
-           gas_data.adc_raw, gas_data.rs, MQ135_GetR0());
-    printf("  CO2:     %.1f ppm\r\n", gas_data.co2);
-    printf("  NH3:     %.1f ppm\r\n", gas_data.nh4);
-    printf("  CO:      %.1f ppm\r\n", gas_data.co);
-    printf("  Alcohol: %.1f ppm\r\n", gas_data.alcohol);
-    printf("  Toluene: %.1f ppm\r\n", gas_data.toluene);
+           snap_gas.adc_raw, snap_gas.rs, MQ135_GetR0());
+    printf("  CO2:     %.1f ppm\r\n", snap_gas.co2);
+    printf("  NH3:     %.1f ppm\r\n", snap_gas.nh4);
+    printf("  CO:      %.1f ppm\r\n", snap_gas.co);
+    printf("  Alcohol: %.1f ppm\r\n", snap_gas.alcohol);
+    printf("  Toluene: %.1f ppm\r\n", snap_gas.toluene);
     printf("-----------------------\r\n");
 
     /* ---- Send binary frame to ESP-01 via USART3 ---- */
     uint8_t frame[FRAME_TOTAL];
     uint8_t idx = 0;
     SensorPayload_t p;
-    p.temperature = dht_data.temperature;
-    p.humidity    = dht_data.humidity;
-    p.co2         = gas_data.co2;
-    p.nh3         = gas_data.nh4;
-    p.co          = gas_data.co;
-    p.alcohol     = gas_data.alcohol;
-    p.toluene     = gas_data.toluene;
-    p.adc_raw     = gas_data.adc_raw;
+    p.temperature = snap_dht.temperature;
+    p.humidity    = snap_dht.humidity;
+    p.co2         = snap_gas.co2;
+    p.nh4         = snap_gas.nh4;  /* Bug 1 fix: field renamed nh3→nh4 */
+    p.co          = snap_gas.co;
+    p.alcohol     = snap_gas.alcohol;
+    p.toluene     = snap_gas.toluene;
+    p.adc_raw     = snap_gas.adc_raw;
     frame[idx++] = FRAME_SOF;
     frame[idx++] = (uint8_t)sizeof(SensorPayload_t);
     memcpy(&frame[idx], &p, sizeof(SensorPayload_t));
@@ -972,19 +947,26 @@ void StartDefaultTask(void const * argument)
 
     printf("[PWR] Entering Stop Mode (5-min sleep)... ZZZ\r\n");
 
-    /* Suspend FreeRTOS SysTick so it doesn't wake the CPU from Stop mode */
+    /* Bug 3 fix: suspend the FreeRTOS scheduler and SysTick before entering
+     * Stop mode so no other task or tick ISR fires while the CPU is halted.
+     * On wake, resume the scheduler before any RTOS API call is made.
+     * NOTE: This is the safest pragmatic approach on CMSIS-RTOS v1 / FreeRTOS
+     * without a dedicated low-power port. All tasks simply see a longer osDelay
+     * period, which is acceptable for a 5-minute duty cycle. */
+    vTaskSuspendAll();
     HAL_SuspendTick();
 
     /* ── STEP 10 cont.: Enter Stop mode — CPU halts here ── */
     HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
 
     /* ════════════════════════════════════════════════════
-     *  <<< RTC ALARM FIRES — CPU RESUMES HERE >>>  
+     *  <<< RTC ALARM FIRES — CPU RESUMES HERE >>>
      * ════════════════════════════════════════════════════ */
 
     /* ── STEP 11: Restore PLL clock (Stop mode falls back to HSI) ── */
     SystemClock_Config();
     HAL_ResumeTick();
+    xTaskResumeAll();
     printf("[PWR] Woke from Stop mode. Starting new cycle.\r\n");
   }
   /* USER CODE END 5 */
